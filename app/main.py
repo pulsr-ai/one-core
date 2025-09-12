@@ -33,7 +33,6 @@ class DatabaseType(str, Enum):
     EXTERNAL = "external"  # User provides DATABASE_URL
 
 class DeploymentConfig(BaseModel):
-    registry_url: str
     tag: str = "latest"
     database_type: DatabaseType = DatabaseType.MANAGED
     database_url: Optional[str] = None  # Required if database_type is EXTERNAL
@@ -293,13 +292,16 @@ def get_service_environment(service_name: str, config: DeploymentConfig, db_url:
 
 async def deploy_services(config: DeploymentConfig):
     """Deploy all services using Docker SDK directly."""
+    # Fixed registry URL
+    registry_url = "rg.nl-ams.scw.cloud/pulsr-core"
+    
     # Login to registry if needed
-    if config.scaleway_secret and "scw.cloud" in config.registry_url:
+    if config.scaleway_secret:
         try:
             docker_client.login(
                 username="nologin",
                 password=config.scaleway_secret,
-                registry=config.registry_url.split("/")[0]
+                registry="rg.nl-ams.scw.cloud"
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Registry login failed: {str(e)}")
@@ -394,7 +396,7 @@ async def deploy_services(config: DeploymentConfig):
             environment = get_service_environment(service_name, config, db_url)
             
             # Pull service image
-            image_name = f"{config.registry_url}/{service_name}:{config.tag}"
+            image_name = f"{registry_url}/{service_name}:{config.tag}"
             docker_client.images.pull(image_name)
             
             # Start service container
