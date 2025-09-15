@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import Dict, Optional, List
 import httpx
 import asyncio
@@ -9,6 +9,9 @@ import json
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+import logging
+import traceback
+import uuid
 
 app = FastAPI(title="Pulsr Core Service", version="2.0.0")
 
@@ -17,12 +20,12 @@ docker_client = docker.from_env()
 
 # Service configuration
 SERVICES = {
-    "atlas": {"port": 8001, "host": "atlas"},
-    "census": {"port": 8002, "host": "census"},
-    "hermes": {"port": 8003, "host": "hermes"},
-    "lambda": {"port": 8004, "host": "lambda"},
-    "lingua": {"port": 8005, "host": "lingua"},
-    "nexus": {"port": 8006, "host": "nexus"},
+    "atlas": {"port": 8001, "host": "localhost", "internal_host": "atlas"},
+    "census": {"port": 8002, "host": "localhost", "internal_host": "census"},
+    "hermes": {"port": 8003, "host": "localhost", "internal_host": "hermes"},
+    #"lambda": {"port": 8004, "host": "localhost", "internal_host": "lambda"},
+    "lingua": {"port": 8005, "host": "localhost", "internal_host": "lingua"},
+    "nexus": {"port": 8006, "host": "localhost", "internal_host": "nexus"},
 }
 
 # Network name for all services
@@ -31,6 +34,10 @@ NETWORK_NAME = "pulsr-network"
 class DatabaseType(str, Enum):
     MANAGED = "managed"  # We create and manage the PostgreSQL container
     EXTERNAL = "external"  # User provides DATABASE_URL
+
+class MongoType(str, Enum):
+    MANAGED = "managed"    # We create and manage the MongoDB container
+    EXTERNAL = "external"  # User provides MONGODB_URL
 
 class DeploymentConfig(BaseModel):
     tag: str = "latest"
@@ -43,7 +50,8 @@ class DeploymentConfig(BaseModel):
     secret_key: str
     
     # Atlas-specific
-    mongodb_url: Optional[str] = "mongodb://pulsr_mongo:27017"
+    mongo_type: MongoType = MongoType.MANAGED
+    mongodb_url: Optional[str] = None  # Required if mongo_type is EXTERNAL
     mongodb_db: str = "atlas_documents"
     
     # Census-specific
@@ -51,7 +59,6 @@ class DeploymentConfig(BaseModel):
     access_token_expire_minutes: int = 30
     otp_expire_minutes: int = 5
     admin_email: str = "admin@example.com"
-    hermes_api_key: str
     hermes_from_email: str = "noreply@pulsr.one"
     
     # Hermes-specific
@@ -64,7 +71,21 @@ class DeploymentConfig(BaseModel):
     outbound_smtp_password: Optional[str] = None
     outbound_smtp_use_tls: bool = True
     dkim_selector: str = "default"
-    api_key: str
+    hermes_api_key: str  # Merged from api_key - used for both Census->Hermes and Hermes API auth
+    
+    @model_validator(mode='after')
+    def validate_config(self):
+        # Validate database configuration
+        if self.database_type == DatabaseType.EXTERNAL and not self.database_url:
+            raise ValueError("database_url is required when database_type is EXTERNAL")
+        if self.database_type == DatabaseType.MANAGED and not self.postgres_password:
+            raise ValueError("postgres_password is required when database_type is MANAGED")
+            
+        # Validate MongoDB configuration
+        if self.mongo_type == MongoType.EXTERNAL and not self.mongodb_url:
+            raise ValueError("mongodb_url is required when mongo_type is EXTERNAL")
+            
+        return self
     
     # Lingua-specific
     redis_url: Optional[str] = "redis://pulsr_redis:6379"
@@ -98,23 +119,51 @@ class ServiceStatus(BaseModel):
     last_check: Optional[datetime] = None
     error: Optional[str] = None
 
+class DeploymentStep(BaseModel):
+    name: str
+    status: str  # "pending", "in_progress", "completed", "failed"
+    message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+class DeploymentProgress(BaseModel):
+    deployment_id: str
+    status: str  # "starting", "in_progress", "completed", "failed"
+    current_step: Optional[str] = None
+    steps: List[DeploymentStep]
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+    config: Optional[Dict] = None
+
 class SystemStatus(BaseModel):
     deployed: bool
     deployment_config: Optional[Dict] = None
     database_type: Optional[DatabaseType] = None
     database_status: Optional[str] = None
+    mongo_type: Optional[MongoType] = None
+    mongo_status: Optional[str] = None
     services: Dict[str, ServiceStatus]
     healthy_count: int
     unhealthy_count: int
     total_services: int
 
 # Store deployment state
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 deployment_state = {
     "deployed": False,
     "deployment_time": None,
     "configuration": None,
-    "database_type": None
+    "database_type": None,
+    "mongo_type": None
 }
+
+# Deployment progress tracking
+deployment_progress = {}
 
 def get_container_by_name(name: str):
     """Get container by name."""
@@ -131,7 +180,7 @@ async def check_service_health(name: str, config: dict) -> ServiceStatus:
     service_status = ServiceStatus(
         name=name,
         port=config["port"],
-        host=config["host"],
+        host="localhost",  # Always use localhost for health checks from core service
         status="unknown",
         last_check=datetime.utcnow()
     )
@@ -150,9 +199,39 @@ async def check_service_health(name: str, config: dict) -> ServiceStatus:
     
     # Check health endpoint
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            health_url = f"http://{config['host']}:{config['port']}/health"
-            response = await client.get(health_url)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Try to connect to service via container network, fallback to host network
+            health_urls = [
+                f"http://pulsr_{name}:8000/health",  # Container network
+                f"http://172.17.0.1:{config['port']}/health",  # Docker bridge gateway
+                f"http://host.docker.internal:{config['port']}/health",  # Docker Desktop
+            ]
+            
+            response = None
+            last_error = None
+            
+            for health_url in health_urls:
+                try:
+                    logger.info(f"Trying health check for {name} at {health_url}")
+                    response = await client.get(health_url, timeout=3.0)
+                    logger.info(f"Successfully connected to {name} at {health_url}")
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.debug(f"Failed to connect to {name} at {health_url}: {e}")
+                    continue
+            
+            if response is None:
+                # Try to connect core to the pulsr network
+                try:
+                    await self_connect_to_network()
+                    # Retry with container network after connecting
+                    health_url = f"http://pulsr_{name}:8000/health"
+                    response = await client.get(health_url, timeout=3.0)
+                    logger.info(f"Connected to network and reached {name}")
+                except Exception as net_error:
+                    logger.error(f"Failed to connect to network: {net_error}")
+                    raise Exception(f"All health check attempts failed. Last error: {last_error}")
             
             if response.status_code == 200:
                 service_status.status = "healthy"
@@ -160,19 +239,40 @@ async def check_service_health(name: str, config: dict) -> ServiceStatus:
                     service_status.health = response.json()
                 except:
                     service_status.health = {"raw": response.text}
+                logger.info(f"Service {name} is healthy")
             else:
                 service_status.status = "unhealthy"
                 service_status.error = f"HTTP {response.status_code}"
+                logger.warning(f"Service {name} returned HTTP {response.status_code}")
                 
-    except httpx.ConnectError:
+    except httpx.ConnectError as e:
         service_status.status = "unreachable"
-        service_status.error = "Connection failed"
-    except httpx.TimeoutException:
+        service_status.error = f"Connection failed: {str(e)}"
+        logger.error(f"Service {name} connection failed: {str(e)}")
+    except httpx.TimeoutException as e:
         service_status.status = "timeout"
-        service_status.error = "Request timeout"
+        service_status.error = f"Request timeout: {str(e)}"
+        logger.error(f"Service {name} timeout: {str(e)}")
     except Exception as e:
         service_status.status = "error"
-        service_status.error = str(e)
+        service_status.error = f"Health check error: {str(e)}"
+        logger.error(f"Service {name} health check error: {str(e)}")
+    
+    # Add container diagnostic info if container exists but service is unhealthy
+    if container and service_status.status in ["unreachable", "timeout", "unhealthy", "error"]:
+        try:
+            # Get container logs (last 50 lines)
+            logs = container.logs(tail=50).decode('utf-8', errors='ignore')
+            service_status.health = {
+                "container_status": container.status,
+                "container_created": container.attrs.get('Created'),
+                "container_started": container.attrs.get('State', {}).get('StartedAt'),
+                "restart_count": container.attrs.get('RestartCount', 0),
+                "exit_code": container.attrs.get('State', {}).get('ExitCode'),
+                "last_logs": logs[-1000:] if logs else "No logs available"  # Last 1000 chars
+            }
+        except Exception as log_error:
+            logger.error(f"Failed to get container diagnostics for {name}: {log_error}")
     
     return service_status
 
@@ -183,29 +283,127 @@ def create_network():
     except docker.errors.NotFound:
         return docker_client.networks.create(NETWORK_NAME, driver="bridge")
 
+async def self_connect_to_network():
+    """Connect the core service container to the pulsr network."""
+    try:
+        # Get our own container
+        import socket
+        hostname = socket.gethostname()
+        core_container = docker_client.containers.get(hostname)
+        
+        # Get the pulsr network
+        network = docker_client.networks.get(NETWORK_NAME)
+        
+        # Connect to network if not already connected
+        if NETWORK_NAME not in [net['Name'] for net in core_container.attrs['NetworkSettings']['Networks']]:
+            network.connect(core_container)
+            logger.info(f"Connected core container {hostname} to {NETWORK_NAME}")
+        else:
+            logger.info(f"Core container already connected to {NETWORK_NAME}")
+            
+    except Exception as e:
+        logger.error(f"Failed to connect core to network: {e}")
+        raise
+
 def create_postgres_init_script():
     """Create PostgreSQL initialization script."""
-    init_sql = """-- Create separate databases for each microservice
-CREATE DATABASE atlas;
-CREATE DATABASE census;
-CREATE DATABASE hermes;
-CREATE DATABASE lambda;
-CREATE DATABASE lingua;
-CREATE DATABASE nexus;
+    init_sql = """#!/bin/bash
+set -e
 
--- Grant all privileges
-GRANT ALL PRIVILEGES ON DATABASE atlas TO pulsr;
-GRANT ALL PRIVILEGES ON DATABASE census TO pulsr;
-GRANT ALL PRIVILEGES ON DATABASE hermes TO pulsr;
-GRANT ALL PRIVILEGES ON DATABASE lambda TO pulsr;
-GRANT ALL PRIVILEGES ON DATABASE lingua TO pulsr;
-GRANT ALL PRIVILEGES ON DATABASE nexus TO pulsr;"""
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+    -- Create separate databases for each microservice
+    CREATE DATABASE atlas;
+    CREATE DATABASE census;
+    CREATE DATABASE hermes;
+    CREATE DATABASE lingua;
+    CREATE DATABASE nexus;
+
+    -- Grant all privileges
+    GRANT ALL PRIVILEGES ON DATABASE atlas TO pulsr;
+    GRANT ALL PRIVILEGES ON DATABASE census TO pulsr;
+    GRANT ALL PRIVILEGES ON DATABASE hermes TO pulsr;
+    GRANT ALL PRIVILEGES ON DATABASE lingua TO pulsr;
+    GRANT ALL PRIVILEGES ON DATABASE nexus TO pulsr;
+EOSQL
+
+echo "Databases created successfully"
+"""
     
     # Create temp file for init script
-    init_path = "/tmp/init-databases.sql"
+    init_path = "/tmp/init-databases.sh"
     with open(init_path, "w") as f:
         f.write(init_sql)
+    
+    # Make the script executable
+    import os
+    os.chmod(init_path, 0o755)
     return init_path
+
+async def verify_databases_created(postgres_password: str):
+    """Verify that all required databases exist using docker exec."""
+    container = get_container_by_name("pulsr_postgres")
+    if not container:
+        raise Exception("PostgreSQL container not found")
+    
+    # Wait a bit more for PostgreSQL to be fully ready
+    await asyncio.sleep(5)
+    
+    # Check if databases exist
+    result = container.exec_run([
+        "psql", "-U", "pulsr", "-d", "postgres", "-t", "-c",
+        "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres');"
+    ], environment={"PGPASSWORD": postgres_password})
+    
+    logger.info(f"Database check result - Exit code: {result.exit_code}, Output: {result.output.decode()}")
+    
+    if result.exit_code != 0:
+        raise Exception(f"Failed to check databases: {result.output.decode()}")
+    
+    existing_dbs = [db.strip() for db in result.output.decode().strip().split('\n') if db.strip()]
+    required_dbs = ["atlas", "census", "hermes", "lingua", "nexus"]  # Removed lambda since it's commented out
+    missing_dbs = [db for db in required_dbs if db not in existing_dbs]
+    
+    logger.info(f"Existing databases: {existing_dbs}")
+    logger.info(f"Required databases: {required_dbs}")
+    
+    if missing_dbs:
+        logger.warning(f"Missing databases: {missing_dbs}")
+        raise Exception(f"Missing databases: {missing_dbs}")
+        
+    logger.info(f"All required databases exist: {existing_dbs}")
+
+async def create_databases_manually(postgres_password: str):
+    """Create databases manually using docker exec."""
+    container = get_container_by_name("pulsr_postgres")
+    if not container:
+        raise Exception("PostgreSQL container not found")
+    
+    required_dbs = ["atlas", "census", "hermes", "lingua", "nexus"]  # Removed lambda since it's commented out
+    
+    for db_name in required_dbs:
+        # Create database
+        result = container.exec_run([
+            "psql", "-U", "pulsr", "-d", "postgres", "-c",
+            f"CREATE DATABASE {db_name};"
+        ], environment={"PGPASSWORD": postgres_password})
+        
+        if result.exit_code == 0:
+            logger.info(f"Created database: {db_name}")
+        elif "already exists" in result.output.decode():
+            logger.info(f"Database already exists: {db_name}")
+        else:
+            logger.error(f"Failed to create database {db_name}: {result.output.decode()}")
+            
+        # Grant privileges
+        result = container.exec_run([
+            "psql", "-U", "pulsr", "-d", "postgres", "-c",
+            f"GRANT ALL PRIVILEGES ON DATABASE {db_name} TO pulsr;"
+        ], environment={"PGPASSWORD": postgres_password})
+        
+        if result.exit_code == 0:
+            logger.info(f"Granted privileges on {db_name}")
+        else:
+            logger.warning(f"Failed to grant privileges on {db_name}: {result.output.decode()}")
 
 def get_service_environment(service_name: str, config: DeploymentConfig, db_url: str) -> dict:
     """Generate service-specific environment variables."""
@@ -221,8 +419,10 @@ def get_service_environment(service_name: str, config: DeploymentConfig, db_url:
     }
     
     if service_name == "atlas":
+        # Set MongoDB URL based on mongo_type
+        mongodb_url = config.mongodb_url if config.mongo_type == MongoType.EXTERNAL else "mongodb://pulsr_mongo:27017"
         env.update({
-            "MONGODB_URL": config.mongodb_url,
+            "MONGODB_URL": mongodb_url,
             "MONGODB_DB": config.mongodb_db,
             "LINGUA_API_URL": "http://pulsr_lingua:8000"
         })
@@ -244,7 +444,7 @@ def get_service_environment(service_name: str, config: DeploymentConfig, db_url:
             "SMTP_PORT": str(config.smtp_port),
             "SMTP_DOMAIN": config.smtp_domain,
             "DKIM_SELECTOR": config.dkim_selector,
-            "API_KEY": config.api_key
+            "API_KEY": config.hermes_api_key
         })
         
         # Optional SMTP settings
@@ -290,140 +490,273 @@ def get_service_environment(service_name: str, config: DeploymentConfig, db_url:
     
     return env
 
-async def deploy_services(config: DeploymentConfig):
-    """Deploy all services using Docker SDK directly."""
-    # Fixed registry URL
-    registry_url = "rg.nl-ams.scw.cloud/pulsr-core"
+def update_deployment_step(deployment_id: str, step_name: str, status: str, message: str = None, error: str = None):
+    """Update deployment step status."""
+    if deployment_id not in deployment_progress:
+        return
     
-    # Login to registry if needed
-    if config.scaleway_secret:
-        try:
-            docker_client.login(
-                username="nologin",
-                password=config.scaleway_secret,
-                registry="rg.nl-ams.scw.cloud"
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Registry login failed: {str(e)}")
+    progress = deployment_progress[deployment_id]
     
+    # Find and update the step
+    for step in progress["steps"]:
+        if step["name"] == step_name:
+            step["status"] = status
+            step["message"] = message
+            if status == "in_progress" and not step.get("started_at"):
+                step["started_at"] = datetime.utcnow()
+            elif status in ["completed", "failed"]:
+                step["completed_at"] = datetime.utcnow()
+            if error:
+                step["error"] = error
+            break
+    
+    # Update overall progress
+    if status == "in_progress":
+        progress["current_step"] = step_name
+        progress["status"] = "in_progress"
+    elif status == "failed":
+        progress["status"] = "failed"
+        progress["completed_at"] = datetime.utcnow()
+        progress["error"] = error
+    elif status == "completed":
+        # Check if all steps are completed
+        if all(s["status"] == "completed" for s in progress["steps"]):
+            progress["status"] = "completed"
+            progress["completed_at"] = datetime.utcnow()
+            progress["current_step"] = None
+
+async def deploy_services_background(config: DeploymentConfig, deployment_id: str):
+    """Deploy all services using Docker SDK directly with progress tracking."""
     try:
-        # Create network
-        network = create_network()
+        logger.info(f"Starting deployment {deployment_id}")
         
-        # Create volume for PostgreSQL if managed
+        # Fixed registry URL
+        registry_url = "rg.nl-ams.scw.cloud/pulsr-core"
+    
+        # Step 1: Registry login
+        update_deployment_step(deployment_id, "registry_login", "in_progress", "Logging into container registry")
+        if config.scaleway_secret:
+            try:
+                docker_client.login(
+                    username="nologin",
+                    password=config.scaleway_secret,
+                    registry="rg.nl-ams.scw.cloud"
+                )
+                update_deployment_step(deployment_id, "registry_login", "completed", "Registry login successful")
+            except Exception as e:
+                error_msg = f"Registry login failed: {str(e)}"
+                logger.error(error_msg)
+                update_deployment_step(deployment_id, "registry_login", "failed", error=error_msg)
+                raise Exception(error_msg)
+        else:
+            update_deployment_step(deployment_id, "registry_login", "completed", "No registry authentication required")
+        
+        # Step 2: Network setup
+        update_deployment_step(deployment_id, "network_setup", "in_progress", "Creating Docker network")
+        try:
+            network = create_network()
+            update_deployment_step(deployment_id, "network_setup", "completed", "Network created successfully")
+        except Exception as e:
+            error_msg = f"Network creation failed: {str(e)}"
+            logger.error(error_msg)
+            update_deployment_step(deployment_id, "network_setup", "failed", error=error_msg)
+            raise Exception(error_msg)
+        
+        # Step 3: Database setup
         postgres_container = None
         if config.database_type == DatabaseType.MANAGED:
-            # Create volume
+            update_deployment_step(deployment_id, "database_setup", "in_progress", "Setting up PostgreSQL database")
             try:
-                docker_client.volumes.get("postgres_data")
-            except docker.errors.NotFound:
-                docker_client.volumes.create("postgres_data")
-            
-            # Create init script
-            init_script_path = create_postgres_init_script()
-            
-            # Pull PostgreSQL image
-            docker_client.images.pull("postgres:15")
-            
-            # Start PostgreSQL container
-            postgres_container = docker_client.containers.run(
-                "postgres:15",
-                name="pulsr_postgres",
-                environment={
-                    "POSTGRES_USER": "pulsr",
-                    "POSTGRES_PASSWORD": config.postgres_password,
-                    "POSTGRES_DB": "postgres"
-                },
-                ports={"5432/tcp": 5432},
-                volumes={
-                    "postgres_data": {"bind": "/var/lib/postgresql/data", "mode": "rw"},
-                    init_script_path: {"bind": "/docker-entrypoint-initdb.d/init.sql", "mode": "ro"}
-                },
-                network=NETWORK_NAME,
-                restart_policy={"Name": "unless-stopped"},
-                detach=True
-            )
-            
-            # Wait for PostgreSQL to be ready
-            await asyncio.sleep(10)
+                # Create volume
+                try:
+                    docker_client.volumes.get("postgres_data")
+                except docker.errors.NotFound:
+                    docker_client.volumes.create("postgres_data")
+                
+                # Create init script
+                init_script_path = create_postgres_init_script()
+                
+                # Pull PostgreSQL image
+                logger.info("Pulling PostgreSQL image")
+                docker_client.images.pull("postgres:15")
+                
+                # Start PostgreSQL container
+                postgres_container = docker_client.containers.run(
+                    "postgres:15",
+                    name="pulsr_postgres",
+                    environment={
+                        "POSTGRES_USER": "pulsr",
+                        "POSTGRES_PASSWORD": config.postgres_password,
+                        "POSTGRES_DB": "postgres"
+                    },
+                    ports={"5432/tcp": 5432},
+                    volumes={
+                        "postgres_data": {"bind": "/var/lib/postgresql/data", "mode": "rw"},
+                        init_script_path: {"bind": "/docker-entrypoint-initdb.d/init.sh", "mode": "ro"}
+                    },
+                    network=NETWORK_NAME,
+                    restart_policy={"Name": "unless-stopped"},
+                    detach=True
+                )
+                
+                # Wait for PostgreSQL to be ready and verify databases
+                logger.info("Waiting for PostgreSQL to be ready...")
+                await asyncio.sleep(15)  # Give more time for init scripts
+                
+                # Verify that databases were created
+                try:
+                    await verify_databases_created(config.postgres_password)
+                    update_deployment_step(deployment_id, "database_setup", "completed", "PostgreSQL databases ready")
+                except Exception as db_error:
+                    # If databases weren't created by init script, create them manually
+                    logger.warning(f"Init script may have failed, creating databases manually: {db_error}")
+                    await create_databases_manually(config.postgres_password)
+                    update_deployment_step(deployment_id, "database_setup", "completed", "PostgreSQL databases created manually")
+                
+            except Exception as e:
+                error_msg = f"PostgreSQL setup failed: {str(e)}"
+                logger.error(error_msg)
+                update_deployment_step(deployment_id, "database_setup", "failed", error=error_msg)
+                raise Exception(error_msg)
+        else:
+            update_deployment_step(deployment_id, "database_setup", "completed", "Using external database")
         
-        # Deploy MongoDB for Atlas
-        if config.mongodb_url and "pulsr_mongo" in config.mongodb_url:
-            # Create MongoDB volume
+        # Step 4: MongoDB setup
+        if config.mongo_type == MongoType.MANAGED:
+            update_deployment_step(deployment_id, "mongodb_setup", "in_progress", "Setting up MongoDB")
             try:
-                docker_client.volumes.get("mongo_data")
-            except docker.errors.NotFound:
-                docker_client.volumes.create("mongo_data")
-            
-            # Pull and start MongoDB
-            docker_client.images.pull("mongo:7")
-            docker_client.containers.run(
-                "mongo:7",
-                name="pulsr_mongo",
-                ports={"27017/tcp": 27017},
-                volumes={"mongo_data": {"bind": "/data/db", "mode": "rw"}},
-                network=NETWORK_NAME,
-                restart_policy={"Name": "unless-stopped"},
-                detach=True
-            )
+                # Create MongoDB volume
+                try:
+                    docker_client.volumes.get("mongo_data")
+                except docker.errors.NotFound:
+                    docker_client.volumes.create("mongo_data")
+                
+                # Pull and start MongoDB
+                logger.info("Pulling MongoDB image")
+                docker_client.images.pull("mongo:7")
+                docker_client.containers.run(
+                    "mongo:7",
+                    name="pulsr_mongo",
+                    ports={"27017/tcp": 27017},
+                    volumes={"mongo_data": {"bind": "/data/db", "mode": "rw"}},
+                    network=NETWORK_NAME,
+                    restart_policy={"Name": "unless-stopped"},
+                    detach=True
+                )
+                update_deployment_step(deployment_id, "mongodb_setup", "completed", "MongoDB ready")
+            except Exception as e:
+                error_msg = f"MongoDB setup failed: {str(e)}"
+                logger.error(error_msg)
+                update_deployment_step(deployment_id, "mongodb_setup", "failed", error=error_msg)
+                raise Exception(error_msg)
+        else:
+            update_deployment_step(deployment_id, "mongodb_setup", "completed", "Using external MongoDB")
         
-        # Deploy Redis for Lingua
+        # Step 5: Redis setup
         if config.redis_url and "pulsr_redis" in config.redis_url:
-            # Pull and start Redis
-            docker_client.images.pull("redis:7-alpine")
-            docker_client.containers.run(
-                "redis:7-alpine",
-                name="pulsr_redis",
-                ports={"6379/tcp": 6379},
-                network=NETWORK_NAME,
-                restart_policy={"Name": "unless-stopped"},
-                detach=True
-            )
+            update_deployment_step(deployment_id, "redis_setup", "in_progress", "Setting up Redis")
+            try:
+                # Pull and start Redis
+                logger.info("Pulling Redis image")
+                docker_client.images.pull("redis:7-alpine")
+                docker_client.containers.run(
+                    "redis:7-alpine",
+                    name="pulsr_redis",
+                    ports={"6379/tcp": 6379},
+                    network=NETWORK_NAME,
+                    restart_policy={"Name": "unless-stopped"},
+                    detach=True
+                )
+                update_deployment_step(deployment_id, "redis_setup", "completed", "Redis ready")
+            except Exception as e:
+                error_msg = f"Redis setup failed: {str(e)}"
+                logger.error(error_msg)
+                update_deployment_step(deployment_id, "redis_setup", "failed", error=error_msg)
+                raise Exception(error_msg)
+        else:
+            update_deployment_step(deployment_id, "redis_setup", "completed", "Using external Redis")
         
-        # Wait a bit for services to start
+        # Wait a bit for infrastructure services to start
+        logger.info("Waiting for infrastructure services...")
         await asyncio.sleep(5)
         
-        # Deploy each microservice
+        # Step 6: Deploy microservices
+        update_deployment_step(deployment_id, "services_deployment", "in_progress", "Deploying microservices")
         deployed_services = []
-        for service_name, service_config in SERVICES.items():
-            # Construct database URL
-            if config.database_type == DatabaseType.MANAGED:
-                db_url = f"postgresql://pulsr:{config.postgres_password}@pulsr_postgres:5432/{service_name}"
-            else:
-                db_url = config.database_url
+        
+        try:
+            for service_name, service_config in SERVICES.items():
+                logger.info(f"Deploying service: {service_name}")
+                
+                # Construct database URL
+                if config.database_type == DatabaseType.MANAGED:
+                    db_url = f"postgresql://pulsr:{config.postgres_password}@pulsr_postgres:5432/{service_name}"
+                else:
+                    db_url = config.database_url
+                
+                # Get service-specific environment variables
+                environment = get_service_environment(service_name, config, db_url)
+                
+                # Pull service image
+                image_name = f"{registry_url}/{service_name}:{config.tag}"
+                logger.info(f"Pulling image: {image_name}")
+                docker_client.images.pull(image_name)
+                
+                # Start service container
+                logger.info(f"Starting container: pulsr_{service_name}")
+                container = docker_client.containers.run(
+                    image_name,
+                    name=f"pulsr_{service_name}",
+                    environment=environment,
+                    ports={"8000/tcp": service_config["port"]},
+                    network=NETWORK_NAME,
+                    restart_policy={"Name": "unless-stopped"},
+                    detach=True
+                )
+                deployed_services.append(service_name)
+                logger.info(f"Service {service_name} deployed successfully")
+                
+            update_deployment_step(deployment_id, "services_deployment", "completed", f"All {len(deployed_services)} services deployed")
             
-            # Get service-specific environment variables
-            environment = get_service_environment(service_name, config, db_url)
-            
-            # Pull service image
-            image_name = f"{registry_url}/{service_name}:{config.tag}"
-            docker_client.images.pull(image_name)
-            
-            # Start service container
-            container = docker_client.containers.run(
-                image_name,
-                name=f"pulsr_{service_name}",
-                environment=environment,
-                ports={"8000/tcp": service_config["port"]},
-                network=NETWORK_NAME,
-                restart_policy={"Name": "unless-stopped"},
-                detach=True
-            )
-            deployed_services.append(service_name)
+        except Exception as e:
+            error_msg = f"Service deployment failed: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            update_deployment_step(deployment_id, "services_deployment", "failed", error=error_msg)
+            raise Exception(error_msg)
+        
+        # Step 7: Finalize deployment
+        update_deployment_step(deployment_id, "finalization", "in_progress", "Finalizing deployment")
         
         # Update deployment state
         deployment_state["deployed"] = True
         deployment_state["deployment_time"] = datetime.utcnow()
         deployment_state["configuration"] = config.dict(exclude={"postgres_password", "scaleway_secret"})
         deployment_state["database_type"] = config.database_type
+        deployment_state["mongo_type"] = config.mongo_type
+        
+        update_deployment_step(deployment_id, "finalization", "completed", "Deployment completed successfully")
+        logger.info(f"Deployment {deployment_id} completed successfully")
         
     except Exception as e:
+        error_msg = f"Deployment failed: {str(e)}"
+        logger.error(f"Deployment {deployment_id} failed: {error_msg}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        
+        # Update progress with failure
+        if deployment_id in deployment_progress:
+            deployment_progress[deployment_id]["status"] = "failed"
+            deployment_progress[deployment_id]["error"] = error_msg
+            deployment_progress[deployment_id]["completed_at"] = datetime.utcnow()
+        
         # Cleanup on failure
         try:
             await cleanup_deployment()
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=f"Deployment failed: {str(e)}")
+            logger.info("Cleanup completed after deployment failure")
+        except Exception as cleanup_error:
+            logger.error(f"Cleanup failed: {str(cleanup_error)}")
+        
+        # Don't raise HTTPException here since this runs in background
 
 async def cleanup_deployment():
     """Stop and remove all deployed containers."""
@@ -468,29 +801,97 @@ async def health():
 
 @app.post("/deploy")
 async def deploy(config: DeploymentConfig, background_tasks: BackgroundTasks):
-    """Deploy all microservices."""
+    """Start deployment in background."""
     if deployment_state["deployed"]:
         raise HTTPException(status_code=400, detail="Services already deployed. Use /undeploy first.")
     
-    # Validate configuration
-    if config.database_type == DatabaseType.EXTERNAL and not config.database_url:
-        raise HTTPException(status_code=400, detail="database_url required for external database")
+    # Generate deployment ID
+    deployment_id = str(uuid.uuid4())
     
-    if config.database_type == DatabaseType.MANAGED and not config.postgres_password:
-        raise HTTPException(status_code=400, detail="postgres_password required for managed database")
+    # Initialize deployment progress
+    steps = [
+        {"name": "registry_login", "status": "pending", "message": "Authenticate with container registry", "started_at": None, "completed_at": None, "error": None},
+        {"name": "network_setup", "status": "pending", "message": "Create Docker network", "started_at": None, "completed_at": None, "error": None},
+        {"name": "database_setup", "status": "pending", "message": "Set up database", "started_at": None, "completed_at": None, "error": None},
+        {"name": "mongodb_setup", "status": "pending", "message": "Set up MongoDB", "started_at": None, "completed_at": None, "error": None},
+        {"name": "redis_setup", "status": "pending", "message": "Set up Redis", "started_at": None, "completed_at": None, "error": None},
+        {"name": "services_deployment", "status": "pending", "message": "Deploy microservices", "started_at": None, "completed_at": None, "error": None},
+        {"name": "finalization", "status": "pending", "message": "Finalize deployment", "started_at": None, "completed_at": None, "error": None}
+    ]
     
-    # Start deployment
+    deployment_progress[deployment_id] = {
+        "deployment_id": deployment_id,
+        "status": "starting",
+        "current_step": None,
+        "steps": steps,
+        "started_at": datetime.utcnow(),
+        "completed_at": None,
+        "error": None,
+        "config": config.dict(exclude={"postgres_password", "scaleway_secret"})
+    }
+    
+    # Start deployment in background
+    background_tasks.add_task(deploy_services_background, config, deployment_id)
+    
+    return {
+        "status": "started",
+        "deployment_id": deployment_id,
+        "message": "Deployment started in background",
+        "track_progress": f"/deployment/{deployment_id}",
+        "check_status": "/status"
+    }
+
+@app.get("/deployment/{deployment_id}", response_model=DeploymentProgress)
+async def get_deployment_progress(deployment_id: str):
+    """Get deployment progress by ID."""
+    if deployment_id not in deployment_progress:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    
+    progress = deployment_progress[deployment_id]
+    return DeploymentProgress(**progress)
+
+@app.get("/deployments")
+async def list_deployments():
+    """List all deployment attempts."""
+    return {
+        "deployments": [
+            {
+                "deployment_id": dep_id,
+                "status": progress["status"],
+                "started_at": progress["started_at"],
+                "completed_at": progress.get("completed_at"),
+                "current_step": progress.get("current_step")
+            }
+            for dep_id, progress in deployment_progress.items()
+        ]
+    }
+
+@app.delete("/deployment/{deployment_id}")
+async def delete_deployment_record(deployment_id: str):
+    """Delete deployment progress record."""
+    if deployment_id not in deployment_progress:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    
+    del deployment_progress[deployment_id]
+    return {"message": "Deployment record deleted"}
+
+@app.post("/cleanup")
+async def force_cleanup():
+    """Force cleanup of all Pulsr containers, networks, and optionally volumes."""
     try:
-        await deploy_services(config)
+        await cleanup_deployment()
         return {
-            "status": "deployed",
-            "message": "Services are being deployed",
-            "database_type": config.database_type,
-            "services": list(SERVICES.keys()),
-            "check_status": "/status"
+            "status": "success",
+            "message": "Cleanup completed",
+            "note": "All containers and networks removed. Volumes preserved."
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Cleanup failed: {e}")
+        return {
+            "status": "partial",
+            "message": f"Cleanup partially failed: {str(e)}",
+            "suggestion": "Try manual cleanup commands"
+        }
 
 @app.post("/undeploy")
 async def undeploy(remove_data: bool = False):
@@ -517,6 +918,7 @@ async def undeploy(remove_data: bool = False):
         deployment_state["deployment_time"] = None
         deployment_state["configuration"] = None
         deployment_state["database_type"] = None
+        deployment_state["mongo_type"] = None
         
         return {
             "status": "undeployed",
@@ -546,6 +948,7 @@ async def status():
     
     # Check database status if deployed
     db_status = None
+    mongo_status = None
     if deployment_state["deployed"]:
         if deployment_state["database_type"] == DatabaseType.MANAGED:
             pg_container = get_container_by_name("pulsr_postgres")
@@ -555,12 +958,24 @@ async def status():
                 db_status = "unhealthy"
         else:
             db_status = "external"
+            
+        # Check MongoDB status
+        if deployment_state["mongo_type"] == MongoType.MANAGED:
+            mongo_container = get_container_by_name("pulsr_mongo")
+            if mongo_container and mongo_container.status == "running":
+                mongo_status = "healthy"
+            else:
+                mongo_status = "unhealthy"
+        else:
+            mongo_status = "external"
     
     return SystemStatus(
         deployed=deployment_state["deployed"],
         deployment_config=deployment_state["configuration"],
         database_type=deployment_state["database_type"],
         database_status=db_status,
+        mongo_type=deployment_state["mongo_type"],
+        mongo_status=mongo_status,
         services=services_dict,
         healthy_count=healthy_count,
         unhealthy_count=unhealthy_count,
@@ -575,6 +990,69 @@ async def service_status(service_name: str):
     
     service_info = await check_service_health(service_name, SERVICES[service_name])
     return service_info
+
+@app.get("/logs/{service_name}")
+async def get_service_logs(service_name: str, lines: int = 100):
+    """Get container logs for a service."""
+    if service_name not in SERVICES:
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    container = get_container_by_name(f"pulsr_{service_name}")
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+    
+    try:
+        logs = container.logs(tail=lines).decode('utf-8', errors='ignore')
+        return {
+            "service": service_name,
+            "container_id": container.short_id,
+            "container_status": container.status,
+            "logs": logs,
+            "lines_requested": lines
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get logs: {str(e)}")
+
+@app.get("/diagnostics/{service_name}")
+async def get_service_diagnostics(service_name: str):
+    """Get detailed diagnostics for a service container."""
+    if service_name not in SERVICES:
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    container = get_container_by_name(f"pulsr_{service_name}")
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+    
+    try:
+        # Get container details
+        container.reload()  # Refresh container state
+        attrs = container.attrs
+        
+        return {
+            "service": service_name,
+            "container_id": container.short_id,
+            "container_name": container.name,
+            "status": container.status,
+            "image": attrs.get('Config', {}).get('Image'),
+            "created": attrs.get('Created'),
+            "started_at": attrs.get('State', {}).get('StartedAt'),
+            "finished_at": attrs.get('State', {}).get('FinishedAt'),
+            "exit_code": attrs.get('State', {}).get('ExitCode'),
+            "error": attrs.get('State', {}).get('Error'),
+            "restart_count": attrs.get('RestartCount', 0),
+            "ports": attrs.get('NetworkSettings', {}).get('Ports', {}),
+            "environment": attrs.get('Config', {}).get('Env', []),
+            "mounts": [
+                {
+                    "source": mount.get('Source'),
+                    "destination": mount.get('Destination'),
+                    "mode": mount.get('Mode')
+                }
+                for mount in attrs.get('Mounts', [])
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get diagnostics: {str(e)}")
 
 @app.get("/deployment")
 async def get_deployment_info():
