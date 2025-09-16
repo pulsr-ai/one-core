@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, model_validator
 from typing import Dict, Optional, List
 import httpx
@@ -15,6 +16,15 @@ import uuid
 
 app = FastAPI(title="Pulsr Core Service", version="2.0.0")
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Docker client
 docker_client = docker.from_env()
 
@@ -30,6 +40,9 @@ SERVICES = {
 
 # Network name for all services
 NETWORK_NAME = "pulsr-network"
+
+# Configuration storage path (will be volume mounted)
+CONFIG_STORAGE_PATH = "/app/data/deployment_config.json"
 
 class DatabaseType(str, Enum):
     MANAGED = "managed"  # We create and manage the PostgreSQL container
@@ -165,6 +178,99 @@ deployment_state = {
 # Deployment progress tracking
 deployment_progress = {}
 
+def save_deployment_config(config: DeploymentConfig):
+    """Save deployment configuration to persistent storage."""
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(CONFIG_STORAGE_PATH), exist_ok=True)
+        
+        # Save config with metadata
+        config_data = {
+            "deployment_time": datetime.utcnow().isoformat(),
+            "config": config.dict(exclude={"postgres_password", "scaleway_secret"}),
+            "database_type": config.database_type,
+            "mongo_type": config.mongo_type
+        }
+        
+        with open(CONFIG_STORAGE_PATH, 'w') as f:
+            json.dump(config_data, f, indent=2)
+            
+        logger.info(f"Deployment config saved to {CONFIG_STORAGE_PATH}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save deployment config: {e}")
+
+def load_deployment_config():
+    """Load deployment configuration from persistent storage."""
+    try:
+        if not os.path.exists(CONFIG_STORAGE_PATH):
+            return None
+            
+        with open(CONFIG_STORAGE_PATH, 'r') as f:
+            config_data = json.load(f)
+            
+        logger.info(f"Deployment config loaded from {CONFIG_STORAGE_PATH}")
+        return config_data
+        
+    except Exception as e:
+        logger.error(f"Failed to load deployment config: {e}")
+        return None
+
+def clear_deployment_config():
+    """Clear stored deployment configuration."""
+    try:
+        if os.path.exists(CONFIG_STORAGE_PATH):
+            os.remove(CONFIG_STORAGE_PATH)
+            logger.info("Deployment config cleared")
+    except Exception as e:
+        logger.error(f"Failed to clear deployment config: {e}")
+
+def detect_existing_deployment():
+    """Detect if services are already deployed and update state accordingly."""
+    try:
+        # Check if any pulsr containers are running
+        running_services = []
+        for service_name in SERVICES.keys():
+            container = get_container_by_name(f"pulsr_{service_name}")
+            if container and container.status == "running":
+                running_services.append(service_name)
+        
+        # Check infrastructure containers
+        postgres_running = get_container_by_name("pulsr_postgres") is not None
+        mongo_running = get_container_by_name("pulsr_mongo") is not None
+        
+        if running_services and postgres_running:
+            logger.info(f"Detected existing deployment with services: {running_services}")
+            
+            # Try to load stored configuration
+            stored_config = load_deployment_config()
+            
+            deployment_state["deployed"] = True
+            deployment_state["database_type"] = DatabaseType.MANAGED
+            deployment_state["mongo_type"] = MongoType.MANAGED if mongo_running else MongoType.EXTERNAL
+            
+            if stored_config:
+                # Use stored configuration
+                deployment_state["deployment_time"] = datetime.fromisoformat(stored_config["deployment_time"])
+                deployment_state["configuration"] = stored_config["config"]
+                deployment_state["database_type"] = stored_config.get("database_type", DatabaseType.MANAGED)
+                deployment_state["mongo_type"] = stored_config.get("mongo_type", MongoType.MANAGED)
+                logger.info("Deployment state recovered from stored configuration")
+            else:
+                # Fallback to basic detection
+                deployment_state["deployment_time"] = datetime.utcnow()
+                deployment_state["configuration"] = {
+                    "detected": True,
+                    "services": running_services,
+                    "note": "Deployment state recovered from running containers (no stored config)"
+                }
+                logger.info("Deployment state recovered from containers only (no stored config found)")
+        else:
+            logger.info("No existing deployment detected")
+            
+    except Exception as e:
+        logger.error(f"Failed to detect existing deployment: {e}")
+
 def get_container_by_name(name: str):
     """Get container by name."""
     try:
@@ -213,25 +319,20 @@ async def check_service_health(name: str, config: dict) -> ServiceStatus:
             for health_url in health_urls:
                 try:
                     logger.info(f"Trying health check for {name} at {health_url}")
-                    response = await client.get(health_url, timeout=3.0)
+                    response = await client.get(health_url, timeout=5.0)
                     logger.info(f"Successfully connected to {name} at {health_url}")
                     break
-                except Exception as e:
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
                     last_error = e
                     logger.debug(f"Failed to connect to {name} at {health_url}: {e}")
                     continue
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Unexpected error connecting to {name} at {health_url}: {e}")
+                    continue
             
             if response is None:
-                # Try to connect core to the pulsr network
-                try:
-                    await self_connect_to_network()
-                    # Retry with container network after connecting
-                    health_url = f"http://pulsr_{name}:8000/health"
-                    response = await client.get(health_url, timeout=3.0)
-                    logger.info(f"Connected to network and reached {name}")
-                except Exception as net_error:
-                    logger.error(f"Failed to connect to network: {net_error}")
-                    raise Exception(f"All health check attempts failed. Last error: {last_error}")
+                raise Exception(f"All health check attempts failed. Last error: {last_error}")
             
             if response.status_code == 200:
                 service_status.status = "healthy"
@@ -735,6 +836,9 @@ async def deploy_services_background(config: DeploymentConfig, deployment_id: st
         deployment_state["database_type"] = config.database_type
         deployment_state["mongo_type"] = config.mongo_type
         
+        # Save configuration to persistent storage
+        save_deployment_config(config)
+        
         update_deployment_step(deployment_id, "finalization", "completed", "Deployment completed successfully")
         logger.info(f"Deployment {deployment_id} completed successfully")
         
@@ -877,13 +981,24 @@ async def delete_deployment_record(deployment_id: str):
 
 @app.post("/cleanup")
 async def force_cleanup():
-    """Force cleanup of all Pulsr containers, networks, and optionally volumes."""
+    """Force cleanup of all Pulsr containers, networks, and configuration."""
     try:
         await cleanup_deployment()
+        
+        # Clear deployment state completely (unlike undeploy)
+        deployment_state["deployed"] = False
+        deployment_state["deployment_time"] = None
+        deployment_state["configuration"] = None
+        deployment_state["database_type"] = None
+        deployment_state["mongo_type"] = None
+        
+        # Clear stored configuration
+        clear_deployment_config()
+        
         return {
             "status": "success",
-            "message": "Cleanup completed",
-            "note": "All containers and networks removed. Volumes preserved."
+            "message": "Complete cleanup completed",
+            "note": "All containers, networks, and configuration removed. Volumes preserved."
         }
     except Exception as e:
         logger.error(f"Cleanup failed: {e}")
@@ -896,8 +1011,25 @@ async def force_cleanup():
 @app.post("/undeploy")
 async def undeploy(remove_data: bool = False):
     """Stop and remove all deployed services."""
-    if not deployment_state["deployed"]:
-        raise HTTPException(status_code=400, detail="No services deployed")
+    # Check if any containers are actually running
+    running_containers = []
+    for service_name in SERVICES.keys():
+        container = get_container_by_name(f"pulsr_{service_name}")
+        if container and container.status == "running":
+            running_containers.append(service_name)
+    
+    # Check infrastructure containers
+    infra_containers = []
+    for name in ["pulsr_postgres", "pulsr_mongo", "pulsr_redis"]:
+        container = get_container_by_name(name)
+        if container:
+            infra_containers.append(name)
+    
+    if not running_containers and not infra_containers:
+        raise HTTPException(status_code=400, detail="No services or infrastructure containers found to undeploy")
+    
+    if running_containers or infra_containers:
+        logger.info(f"Undeploying running services: {running_containers}, infrastructure: {infra_containers}")
     
     try:
         # Stop and remove containers
@@ -913,12 +1045,10 @@ async def undeploy(remove_data: bool = False):
                 except docker.errors.NotFound:
                     pass
         
-        # Reset state
+        # Reset state (but keep configuration for redeployment)
         deployment_state["deployed"] = False
         deployment_state["deployment_time"] = None
-        deployment_state["configuration"] = None
-        deployment_state["database_type"] = None
-        deployment_state["mongo_type"] = None
+        # Keep configuration, database_type, and mongo_type for redeployment
         
         return {
             "status": "undeployed",
@@ -1065,6 +1195,9 @@ async def get_deployment_info():
         database_status="managed" if deployment_state["database_type"] == DatabaseType.MANAGED else "external",
         services_deployed=list(SERVICES.keys()) if deployment_state["deployed"] else []
     )
+
+# Detect existing deployment on startup
+detect_existing_deployment()
 
 if __name__ == "__main__":
     import uvicorn
