@@ -13,8 +13,8 @@ jobs:
       with:
         username: nologin
         password: ${{ secrets.SCALEWAY_API_KEY }}
-        registry: ${{ secrets.CONTAINER_REGISTRY_ENDPOINT }}
+        registry: ${{ secrets.CONTAINER_REGISTRY_ENDPOINT_PRIVATE }}
     - name: Build the Docker image
-      run: docker build . -t ${{ secrets.CONTAINER_REGISTRY_ENDPOINT }}/one-core
+      run: docker build . -t ${{ secrets.CONTAINER_REGISTRY_ENDPOINT_PRIVATE }}/orchestrator
     - name: Push the Docker Image
-      run: docker push ${{ secrets.CONTAINER_REGISTRY_ENDPOINT }}/one-core 
+      run: docker push ${{ secrets.CONTAINER_REGISTRY_ENDPOINT_PRIVATE }}/orchestrator

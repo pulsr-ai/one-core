@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, model_validator
 from typing import Dict, Optional, List
 import httpx
@@ -15,6 +16,20 @@ import uuid
 
 app = FastAPI(title="Pulsr Core Service", version="2.0.0")
 
+# Add CORS middleware
+# Note: In production with HTTPS, update allow_origins to include your domain
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://*.pulsr.one",  # Wildcard for subdomains (note: may need specific domains in production)
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Docker client
 docker_client = docker.from_env()
 
@@ -23,13 +38,16 @@ SERVICES = {
     "atlas": {"port": 8001, "host": "localhost", "internal_host": "atlas"},
     "census": {"port": 8002, "host": "localhost", "internal_host": "census"},
     "hermes": {"port": 8003, "host": "localhost", "internal_host": "hermes"},
-    #"lambda": {"port": 8004, "host": "localhost", "internal_host": "lambda"},
+    #"maestro": {"port": 8004, "host": "localhost", "internal_host": "maestro"},
     "lingua": {"port": 8005, "host": "localhost", "internal_host": "lingua"},
     "nexus": {"port": 8006, "host": "localhost", "internal_host": "nexus"},
 }
 
 # Network name for all services
 NETWORK_NAME = "pulsr-network"
+
+# Configuration storage path (will be volume mounted)
+CONFIG_STORAGE_PATH = "/app/data/deployment_config.json"
 
 class DatabaseType(str, Enum):
     MANAGED = "managed"  # We create and manage the PostgreSQL container
@@ -45,22 +63,28 @@ class DeploymentConfig(BaseModel):
     database_url: Optional[str] = None  # Required if database_type is EXTERNAL
     postgres_password: Optional[str] = None  # Required if database_type is MANAGED
     scaleway_secret: Optional[str] = None  # For Scaleway registry auth
-    
+
     # Shared environment variables
     secret_key: str
-    
+
+    # Traefik/HTTPS configuration
+    domain: Optional[str] = None  # Base domain (e.g., pulsr.example.com)
+    enable_https: bool = True  # Enable HTTPS with Let's Encrypt
+    letsencrypt_email: Optional[str] = None  # Defaults to admin_email if not provided
+    traefik_dashboard: bool = False  # Enable Traefik dashboard
+
     # Atlas-specific
     mongo_type: MongoType = MongoType.MANAGED
     mongodb_url: Optional[str] = None  # Required if mongo_type is EXTERNAL
     mongodb_db: str = "atlas_documents"
-    
+
     # Census-specific
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     otp_expire_minutes: int = 5
     admin_email: str = "admin@example.com"
     hermes_from_email: str = "noreply@pulsr.one"
-    
+
     # Hermes-specific
     smtp_host: str = "0.0.0.0"
     smtp_port: int = 25
@@ -80,11 +104,19 @@ class DeploymentConfig(BaseModel):
             raise ValueError("database_url is required when database_type is EXTERNAL")
         if self.database_type == DatabaseType.MANAGED and not self.postgres_password:
             raise ValueError("postgres_password is required when database_type is MANAGED")
-            
+
         # Validate MongoDB configuration
         if self.mongo_type == MongoType.EXTERNAL and not self.mongodb_url:
             raise ValueError("mongodb_url is required when mongo_type is EXTERNAL")
-            
+
+        # Set letsencrypt_email to admin_email if not provided
+        if not self.letsencrypt_email:
+            self.letsencrypt_email = self.admin_email
+
+        # Validate HTTPS configuration
+        if self.enable_https and not self.domain:
+            raise ValueError("domain is required when enable_https is True")
+
         return self
     
     # Lingua-specific
@@ -154,16 +186,304 @@ class SystemStatus(BaseModel):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-deployment_state = {
-    "deployed": False,
-    "deployment_time": None,
-    "configuration": None,
-    "database_type": None,
-    "mongo_type": None
-}
+# Dynamic deployment state - computed from containers and stored config
+def get_deployment_state():
+    """
+    Compute deployment state dynamically from running containers and stored config.
+    This is the single source of truth for deployment status.
+    """
+    # Check for running service containers
+    running_services = []
+    for service_name in SERVICES.keys():
+        container = get_container_by_name(f"pulsr_{service_name}")
+        if container and container.status == "running":
+            running_services.append(service_name)
+    
+    # Check infrastructure containers
+    postgres_running = False
+    mongo_running = False
+    redis_running = False
+    
+    postgres_container = get_container_by_name("pulsr_postgres")
+    if postgres_container and postgres_container.status == "running":
+        postgres_running = True
+    
+    mongo_container = get_container_by_name("pulsr_mongo")
+    if mongo_container and mongo_container.status == "running":
+        mongo_running = True
+        
+    redis_container = get_container_by_name("pulsr_redis")
+    if redis_container and redis_container.status == "running":
+        redis_running = True
+    
+    # Determine if we have a deployment (services + some infrastructure)
+    deployed = len(running_services) > 0 and (postgres_running or mongo_running or redis_running)
+    
+    # Load stored configuration if available
+    stored_config = load_deployment_config()
+    configuration = None
+    database_type = None
+    mongo_type = None
+    deployment_time = None
+    
+    if stored_config:
+        configuration = stored_config.get("config", {})
+        database_type = stored_config.get("database_type")
+        mongo_type = stored_config.get("mongo_type") 
+        deployment_time = stored_config.get("deployment_time")
+        if deployment_time and isinstance(deployment_time, str):
+            deployment_time = datetime.fromisoformat(deployment_time)
+    else:
+        # Try to recover configuration from container environment variables
+        recovered_config = recover_config_from_containers()
+        
+        if recovered_config:
+            configuration = recovered_config
+            database_type = recovered_config.get("database_type", DatabaseType.MANAGED if postgres_running else DatabaseType.EXTERNAL)
+            mongo_type = recovered_config.get("mongo_type", MongoType.MANAGED if mongo_running else MongoType.EXTERNAL)
+            deployment_time = None  # Unknown without stored config
+            logger.info("Using configuration recovered from container environment variables")
+        else:
+            # Final fallback: infer types from running containers
+            database_type = DatabaseType.MANAGED if postgres_running else DatabaseType.EXTERNAL
+            mongo_type = MongoType.MANAGED if mongo_running else MongoType.EXTERNAL
+            deployment_time = None  # Unknown without stored config
+            configuration = {
+                "detected": True,
+                "services": running_services,
+                "note": "State computed from running containers (no stored config or recoverable config)"
+            } if deployed else None
+    
+    return {
+        "deployed": deployed,
+        "deployment_time": deployment_time,
+        "configuration": configuration,
+        "database_type": database_type,
+        "mongo_type": mongo_type,
+        "running_services": running_services,
+        "infrastructure": {
+            "postgres": postgres_running,
+            "mongo": mongo_running,
+            "redis": redis_running
+        }
+    }
 
 # Deployment progress tracking
 deployment_progress = {}
+
+def save_deployment_config(config: DeploymentConfig):
+    """Save deployment configuration to persistent storage."""
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(CONFIG_STORAGE_PATH), exist_ok=True)
+        
+        # Save config with metadata
+        config_data = {
+            "deployment_time": datetime.utcnow().isoformat(),
+            "config": config.dict(exclude={"postgres_password", "scaleway_secret"}),
+            "database_type": config.database_type,
+            "mongo_type": config.mongo_type
+        }
+        
+        with open(CONFIG_STORAGE_PATH, 'w') as f:
+            json.dump(config_data, f, indent=2)
+            
+        logger.info(f"Deployment config saved to {CONFIG_STORAGE_PATH}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save deployment config: {e}")
+
+def load_deployment_config():
+    """Load deployment configuration from persistent storage."""
+    try:
+        if not os.path.exists(CONFIG_STORAGE_PATH):
+            return None
+            
+        with open(CONFIG_STORAGE_PATH, 'r') as f:
+            config_data = json.load(f)
+            
+        logger.info(f"Deployment config loaded from {CONFIG_STORAGE_PATH}")
+        return config_data
+        
+    except Exception as e:
+        logger.error(f"Failed to load deployment config: {e}")
+        return None
+
+def recover_config_from_containers():
+    """Recover deployment configuration from running container environment variables."""
+    try:
+        recovered_config = {}
+        
+        # Try to get config from Census container (has most config values)
+        census_container = get_container_by_name("pulsr_census")
+        if census_container:
+            env_vars = {}
+            container_env = census_container.attrs.get('Config', {}).get('Env', [])
+            for env_var in container_env:
+                if '=' in env_var:
+                    key, value = env_var.split('=', 1)
+                    env_vars[key] = value
+            
+            # Extract config values from Census environment
+            if 'SECRET_KEY' in env_vars:
+                recovered_config['secret_key'] = env_vars['SECRET_KEY']
+            if 'ADMIN_EMAIL' in env_vars:
+                recovered_config['admin_email'] = env_vars['ADMIN_EMAIL']
+            if 'ALGORITHM' in env_vars:
+                recovered_config['algorithm'] = env_vars['ALGORITHM']
+            if 'ACCESS_TOKEN_EXPIRE_MINUTES' in env_vars:
+                recovered_config['access_token_expire_minutes'] = int(env_vars['ACCESS_TOKEN_EXPIRE_MINUTES'])
+            if 'OTP_EXPIRE_MINUTES' in env_vars:
+                recovered_config['otp_expire_minutes'] = int(env_vars['OTP_EXPIRE_MINUTES'])
+            if 'HERMES_API_KEY' in env_vars:
+                recovered_config['hermes_api_key'] = env_vars['HERMES_API_KEY']
+            if 'HERMES_FROM_EMAIL' in env_vars:
+                recovered_config['hermes_from_email'] = env_vars['HERMES_FROM_EMAIL']
+        
+        # Get config from Hermes container
+        hermes_container = get_container_by_name("pulsr_hermes")
+        if hermes_container:
+            env_vars = {}
+            container_env = hermes_container.attrs.get('Config', {}).get('Env', [])
+            for env_var in container_env:
+                if '=' in env_var:
+                    key, value = env_var.split('=', 1)
+                    env_vars[key] = value
+            
+            if 'SMTP_HOST' in env_vars:
+                recovered_config['smtp_host'] = env_vars['SMTP_HOST']
+            if 'SMTP_PORT' in env_vars:
+                recovered_config['smtp_port'] = int(env_vars['SMTP_PORT'])
+            if 'SMTP_DOMAIN' in env_vars:
+                recovered_config['smtp_domain'] = env_vars['SMTP_DOMAIN']
+            if 'DKIM_SELECTOR' in env_vars:
+                recovered_config['dkim_selector'] = env_vars['DKIM_SELECTOR']
+            if 'OUTBOUND_SMTP_HOST' in env_vars:
+                recovered_config['outbound_smtp_host'] = env_vars['OUTBOUND_SMTP_HOST']
+            if 'OUTBOUND_SMTP_PORT' in env_vars:
+                recovered_config['outbound_smtp_port'] = int(env_vars['OUTBOUND_SMTP_PORT'])
+            if 'OUTBOUND_SMTP_USER' in env_vars:
+                recovered_config['outbound_smtp_user'] = env_vars['OUTBOUND_SMTP_USER']
+            if 'OUTBOUND_SMTP_USE_TLS' in env_vars:
+                recovered_config['outbound_smtp_use_tls'] = env_vars['OUTBOUND_SMTP_USE_TLS'].lower() == 'true'
+        
+        # Get config from Atlas container
+        atlas_container = get_container_by_name("pulsr_atlas")
+        if atlas_container:
+            env_vars = {}
+            container_env = atlas_container.attrs.get('Config', {}).get('Env', [])
+            for env_var in container_env:
+                if '=' in env_var:
+                    key, value = env_var.split('=', 1)
+                    env_vars[key] = value
+            
+            if 'MONGODB_URL' in env_vars:
+                if 'pulsr_mongo' in env_vars['MONGODB_URL']:
+                    recovered_config['mongo_type'] = 'managed'
+                else:
+                    recovered_config['mongo_type'] = 'external'
+                    recovered_config['mongodb_url'] = env_vars['MONGODB_URL']
+            if 'MONGODB_DB' in env_vars:
+                recovered_config['mongodb_db'] = env_vars['MONGODB_DB']
+        
+        # Get config from Lingua container
+        lingua_container = get_container_by_name("pulsr_lingua")
+        if lingua_container:
+            env_vars = {}
+            container_env = lingua_container.attrs.get('Config', {}).get('Env', [])
+            for env_var in container_env:
+                if '=' in env_var:
+                    key, value = env_var.split('=', 1)
+                    env_vars[key] = value
+            
+            if 'REDIS_URL' in env_vars:
+                recovered_config['redis_url'] = env_vars['REDIS_URL']
+            if 'DEFAULT_LLM_PROVIDER' in env_vars:
+                recovered_config['default_llm_provider'] = env_vars['DEFAULT_LLM_PROVIDER']
+            if 'OTEL_SERVICE_NAME' in env_vars:
+                recovered_config['otel_service_name'] = env_vars['OTEL_SERVICE_NAME']
+            if 'DEFAULT_MODEL' in env_vars:
+                recovered_config['default_model'] = env_vars['DEFAULT_MODEL']
+            if 'LOCAL_LLM_ENDPOINT' in env_vars:
+                recovered_config['local_llm_endpoint'] = env_vars['LOCAL_LLM_ENDPOINT']
+            if 'PRIVATE_CLOUD_ENDPOINT' in env_vars:
+                recovered_config['private_cloud_endpoint'] = env_vars['PRIVATE_CLOUD_ENDPOINT']
+            if 'OTEL_EXPORTER_OTLP_ENDPOINT' in env_vars:
+                recovered_config['otel_exporter_otlp_endpoint'] = env_vars['OTEL_EXPORTER_OTLP_ENDPOINT']
+        
+        # Determine database type from any service's DATABASE_URL
+        for service_name in SERVICES.keys():
+            container = get_container_by_name(f"pulsr_{service_name}")
+            if container:
+                env_vars = {}
+                container_env = container.attrs.get('Config', {}).get('Env', [])
+                for env_var in container_env:
+                    if '=' in env_var:
+                        key, value = env_var.split('=', 1)
+                        env_vars[key] = value
+                
+                if 'DATABASE_URL' in env_vars:
+                    db_url = env_vars['DATABASE_URL']
+                    if 'pulsr_postgres' in db_url:
+                        recovered_config['database_type'] = 'managed'
+                    else:
+                        recovered_config['database_type'] = 'external'
+                        recovered_config['database_url'] = db_url
+                    break
+        
+        # Set defaults for missing values
+        if 'mongo_type' not in recovered_config:
+            recovered_config['mongo_type'] = 'managed' if get_container_by_name("pulsr_mongo") else 'external'
+        
+        if 'database_type' not in recovered_config:
+            recovered_config['database_type'] = 'managed' if get_container_by_name("pulsr_postgres") else 'external'
+        
+        # Add tag information (default to 'latest' since we can't determine it from containers)
+        recovered_config['tag'] = 'latest'
+        
+        logger.info(f"Recovered configuration from containers: {list(recovered_config.keys())}")
+        return recovered_config
+        
+    except Exception as e:
+        logger.error(f"Failed to recover config from containers: {e}")
+        return {}
+
+def clear_deployment_config():
+    """Clear stored deployment configuration."""
+    try:
+        if os.path.exists(CONFIG_STORAGE_PATH):
+            os.remove(CONFIG_STORAGE_PATH)
+            logger.info("Deployment config cleared")
+    except Exception as e:
+        logger.error(f"Failed to clear deployment config: {e}")
+
+def detect_existing_deployment():
+    """Detect if services are already deployed and update state accordingly."""
+    try:
+        # Check if any pulsr containers are running
+        running_services = []
+        for service_name in SERVICES.keys():
+            container = get_container_by_name(f"pulsr_{service_name}")
+            if container and container.status == "running":
+                running_services.append(service_name)
+        
+        # Check infrastructure containers
+        postgres_running = get_container_by_name("pulsr_postgres") is not None
+        mongo_running = get_container_by_name("pulsr_mongo") is not None
+        
+        if running_services and postgres_running:
+            logger.info(f"Detected existing deployment with services: {running_services}")
+            
+            # Try to load stored configuration
+            stored_config = load_deployment_config()
+            
+            # Note: deployment state is now computed dynamically via get_deployment_state()
+            logger.info("Deployment state will be computed dynamically from containers and stored config")
+        else:
+            logger.info("No existing deployment detected")
+            
+    except Exception as e:
+        logger.error(f"Failed to detect existing deployment: {e}")
 
 def get_container_by_name(name: str):
     """Get container by name."""
@@ -184,7 +504,7 @@ async def check_service_health(name: str, config: dict) -> ServiceStatus:
         status="unknown",
         last_check=datetime.utcnow()
     )
-    
+
     # Check if container exists
     container = get_container_by_name(f"pulsr_{name}")
     if container:
@@ -196,15 +516,13 @@ async def check_service_health(name: str, config: dict) -> ServiceStatus:
     else:
         service_status.status = "not_deployed"
         return service_status
-    
+
     # Check health endpoint
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Try to connect to service via container network, fallback to host network
+            # Always use container network for health checks (works with or without Traefik)
             health_urls = [
-                f"http://pulsr_{name}:8000/health",  # Container network
-                f"http://172.17.0.1:{config['port']}/health",  # Docker bridge gateway
-                f"http://host.docker.internal:{config['port']}/health",  # Docker Desktop
+                f"http://pulsr_{name}:8000/health",  # Container network (primary)
             ]
             
             response = None
@@ -213,25 +531,20 @@ async def check_service_health(name: str, config: dict) -> ServiceStatus:
             for health_url in health_urls:
                 try:
                     logger.info(f"Trying health check for {name} at {health_url}")
-                    response = await client.get(health_url, timeout=3.0)
+                    response = await client.get(health_url, timeout=5.0)
                     logger.info(f"Successfully connected to {name} at {health_url}")
                     break
-                except Exception as e:
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
                     last_error = e
                     logger.debug(f"Failed to connect to {name} at {health_url}: {e}")
                     continue
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Unexpected error connecting to {name} at {health_url}: {e}")
+                    continue
             
             if response is None:
-                # Try to connect core to the pulsr network
-                try:
-                    await self_connect_to_network()
-                    # Retry with container network after connecting
-                    health_url = f"http://pulsr_{name}:8000/health"
-                    response = await client.get(health_url, timeout=3.0)
-                    logger.info(f"Connected to network and reached {name}")
-                except Exception as net_error:
-                    logger.error(f"Failed to connect to network: {net_error}")
-                    raise Exception(f"All health check attempts failed. Last error: {last_error}")
+                raise Exception(f"All health check attempts failed. Last error: {last_error}")
             
             if response.status_code == 200:
                 service_status.status = "healthy"
@@ -675,6 +988,79 @@ async def deploy_services_background(config: DeploymentConfig, deployment_id: st
                 raise Exception(error_msg)
         else:
             update_deployment_step(deployment_id, "redis_setup", "completed", "Using external Redis")
+
+        # Step 5.5: Traefik setup (if HTTPS enabled)
+        if config.enable_https and config.domain:
+            update_deployment_step(deployment_id, "traefik_setup", "in_progress", "Setting up Traefik reverse proxy")
+            try:
+                # Create volume for Let's Encrypt certificates
+                try:
+                    docker_client.volumes.get("traefik_certs")
+                except docker.errors.NotFound:
+                    docker_client.volumes.create("traefik_certs")
+
+                # Pull Traefik image
+                logger.info("Pulling Traefik image")
+                docker_client.images.pull("traefik:v3.0")
+
+                # Build Traefik command arguments
+                traefik_command = [
+                    "--api.dashboard=true" if config.traefik_dashboard else "--api.dashboard=false",
+                    "--api.insecure=false",
+                    "--providers.docker=true",
+                    "--providers.docker.exposedbydefault=false",
+                    "--providers.docker.network=" + NETWORK_NAME,
+                    "--entrypoints.web.address=:80",
+                    "--entrypoints.websecure.address=:443",
+                    "--entrypoints.web.http.redirections.entrypoint.to=websecure",
+                    "--entrypoints.web.http.redirections.entrypoint.scheme=https",
+                    "--certificatesresolvers.letsencrypt.acme.tlschallenge=true",
+                    f"--certificatesresolvers.letsencrypt.acme.email={config.letsencrypt_email}",
+                    "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json",
+                    "--log.level=INFO",
+                    "--accesslog=true"
+                ]
+
+                # Traefik labels for dashboard (if enabled)
+                traefik_labels = {}
+                if config.traefik_dashboard:
+                    traefik_labels = {
+                        "traefik.enable": "true",
+                        f"traefik.http.routers.traefik-dashboard.rule": f"Host(`traefik.{config.domain}`)",
+                        "traefik.http.routers.traefik-dashboard.entrypoints": "websecure",
+                        "traefik.http.routers.traefik-dashboard.tls.certresolver": "letsencrypt",
+                        "traefik.http.routers.traefik-dashboard.service": "api@internal"
+                    }
+
+                # Start Traefik container
+                logger.info("Starting Traefik container")
+                docker_client.containers.run(
+                    "traefik:v3.0",
+                    name="pulsr_traefik",
+                    command=traefik_command,
+                    ports={
+                        "80/tcp": 80,
+                        "443/tcp": 443
+                    },
+                    volumes={
+                        "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "ro"},
+                        "traefik_certs": {"bind": "/letsencrypt", "mode": "rw"}
+                    },
+                    labels=traefik_labels,
+                    network=NETWORK_NAME,
+                    restart_policy={"Name": "unless-stopped"},
+                    detach=True
+                )
+
+                logger.info("Traefik started successfully")
+                update_deployment_step(deployment_id, "traefik_setup", "completed", "Traefik reverse proxy ready")
+            except Exception as e:
+                error_msg = f"Traefik setup failed: {str(e)}"
+                logger.error(error_msg)
+                update_deployment_step(deployment_id, "traefik_setup", "failed", error=error_msg)
+                raise Exception(error_msg)
+        else:
+            update_deployment_step(deployment_id, "traefik_setup", "completed", "HTTPS disabled - no Traefik deployment")
         
         # Wait a bit for infrastructure services to start
         logger.info("Waiting for infrastructure services...")
@@ -683,32 +1069,53 @@ async def deploy_services_background(config: DeploymentConfig, deployment_id: st
         # Step 6: Deploy microservices
         update_deployment_step(deployment_id, "services_deployment", "in_progress", "Deploying microservices")
         deployed_services = []
-        
+
         try:
             for service_name, service_config in SERVICES.items():
                 logger.info(f"Deploying service: {service_name}")
-                
+
                 # Construct database URL
                 if config.database_type == DatabaseType.MANAGED:
                     db_url = f"postgresql://pulsr:{config.postgres_password}@pulsr_postgres:5432/{service_name}"
                 else:
                     db_url = config.database_url
-                
+
                 # Get service-specific environment variables
                 environment = get_service_environment(service_name, config, db_url)
-                
+
                 # Pull service image
                 image_name = f"{registry_url}/{service_name}:{config.tag}"
                 logger.info(f"Pulling image: {image_name}")
                 docker_client.images.pull(image_name)
-                
+
+                # Build Traefik labels if HTTPS is enabled
+                labels = {}
+                if config.enable_https and config.domain:
+                    service_subdomain = f"{service_name}.{config.domain}"
+                    labels = {
+                        "traefik.enable": "true",
+                        f"traefik.http.routers.{service_name}.rule": f"Host(`{service_subdomain}`)",
+                        f"traefik.http.routers.{service_name}.entrypoints": "websecure",
+                        f"traefik.http.routers.{service_name}.tls.certresolver": "letsencrypt",
+                        f"traefik.http.services.{service_name}.loadbalancer.server.port": "8000"
+                    }
+
+                # Determine port mapping based on HTTPS mode
+                if config.enable_https and config.domain:
+                    # No direct port exposure - all traffic via Traefik
+                    ports = {}
+                else:
+                    # Direct port exposure (legacy mode)
+                    ports = {"8000/tcp": service_config["port"]}
+
                 # Start service container
                 logger.info(f"Starting container: pulsr_{service_name}")
                 container = docker_client.containers.run(
                     image_name,
                     name=f"pulsr_{service_name}",
                     environment=environment,
-                    ports={"8000/tcp": service_config["port"]},
+                    ports=ports,
+                    labels=labels,
                     network=NETWORK_NAME,
                     restart_policy={"Name": "unless-stopped"},
                     detach=True
@@ -728,12 +1135,8 @@ async def deploy_services_background(config: DeploymentConfig, deployment_id: st
         # Step 7: Finalize deployment
         update_deployment_step(deployment_id, "finalization", "in_progress", "Finalizing deployment")
         
-        # Update deployment state
-        deployment_state["deployed"] = True
-        deployment_state["deployment_time"] = datetime.utcnow()
-        deployment_state["configuration"] = config.dict(exclude={"postgres_password", "scaleway_secret"})
-        deployment_state["database_type"] = config.database_type
-        deployment_state["mongo_type"] = config.mongo_type
+        # Save configuration to persistent storage (state is now computed dynamically)
+        save_deployment_config(config)
         
         update_deployment_step(deployment_id, "finalization", "completed", "Deployment completed successfully")
         logger.info(f"Deployment {deployment_id} completed successfully")
@@ -761,7 +1164,7 @@ async def deploy_services_background(config: DeploymentConfig, deployment_id: st
 async def cleanup_deployment():
     """Stop and remove all deployed containers."""
     container_names = (
-        ["pulsr_postgres", "pulsr_mongo", "pulsr_redis"] + 
+        ["pulsr_postgres", "pulsr_mongo", "pulsr_redis", "pulsr_traefik"] +
         [f"pulsr_{name}" for name in SERVICES.keys()]
     )
     
@@ -787,11 +1190,12 @@ async def cleanup_deployment():
 @app.get("/")
 async def root():
     """Root endpoint."""
+    state = get_deployment_state()
     return {
         "service": "Pulsr One Core",
         "version": "2.0.0",
-        "endpoints": ["/deploy", "/undeploy", "/status", "/health", "/docs"],
-        "deployed": deployment_state["deployed"]
+        "endpoints": ["/deploy", "/undeploy", "/status", "/health", "/email-credentials", "/docs"],
+        "deployed": state["deployed"]
     }
 
 @app.get("/health")
@@ -802,7 +1206,8 @@ async def health():
 @app.post("/deploy")
 async def deploy(config: DeploymentConfig, background_tasks: BackgroundTasks):
     """Start deployment in background."""
-    if deployment_state["deployed"]:
+    state = get_deployment_state()
+    if state["deployed"]:
         raise HTTPException(status_code=400, detail="Services already deployed. Use /undeploy first.")
     
     # Generate deployment ID
@@ -815,6 +1220,7 @@ async def deploy(config: DeploymentConfig, background_tasks: BackgroundTasks):
         {"name": "database_setup", "status": "pending", "message": "Set up database", "started_at": None, "completed_at": None, "error": None},
         {"name": "mongodb_setup", "status": "pending", "message": "Set up MongoDB", "started_at": None, "completed_at": None, "error": None},
         {"name": "redis_setup", "status": "pending", "message": "Set up Redis", "started_at": None, "completed_at": None, "error": None},
+        {"name": "traefik_setup", "status": "pending", "message": "Set up Traefik reverse proxy", "started_at": None, "completed_at": None, "error": None},
         {"name": "services_deployment", "status": "pending", "message": "Deploy microservices", "started_at": None, "completed_at": None, "error": None},
         {"name": "finalization", "status": "pending", "message": "Finalize deployment", "started_at": None, "completed_at": None, "error": None}
     ]
@@ -877,13 +1283,17 @@ async def delete_deployment_record(deployment_id: str):
 
 @app.post("/cleanup")
 async def force_cleanup():
-    """Force cleanup of all Pulsr containers, networks, and optionally volumes."""
+    """Force cleanup of all Pulsr containers, networks, and configuration."""
     try:
         await cleanup_deployment()
+        
+        # Clear stored configuration (state is now computed dynamically)
+        clear_deployment_config()
+        
         return {
             "status": "success",
-            "message": "Cleanup completed",
-            "note": "All containers and networks removed. Volumes preserved."
+            "message": "Complete cleanup completed",
+            "note": "All containers, networks, and configuration removed. Volumes preserved."
         }
     except Exception as e:
         logger.error(f"Cleanup failed: {e}")
@@ -896,12 +1306,48 @@ async def force_cleanup():
 @app.post("/undeploy")
 async def undeploy(remove_data: bool = False):
     """Stop and remove all deployed services."""
-    if not deployment_state["deployed"]:
-        raise HTTPException(status_code=400, detail="No services deployed")
+    # Check if any containers are actually running
+    running_containers = []
+    for service_name in SERVICES.keys():
+        container = get_container_by_name(f"pulsr_{service_name}")
+        if container and container.status == "running":
+            running_containers.append(service_name)
+    
+    # Check infrastructure containers
+    infra_containers = []
+    for name in ["pulsr_postgres", "pulsr_mongo", "pulsr_redis"]:
+        container = get_container_by_name(name)
+        if container:
+            infra_containers.append(name)
+    
+    # If remove_data is requested, allow cleanup even with no running containers
+    if not running_containers and not infra_containers and not remove_data:
+        raise HTTPException(status_code=400, detail="No services or infrastructure containers found to undeploy")
+    
+    # Check if there are data volumes to remove when no containers are running
+    volumes_exist = False
+    if remove_data and not running_containers and not infra_containers:
+        volume_names = ["postgres_data", "mongo_data"]
+        for volume_name in volume_names:
+            try:
+                docker_client.volumes.get(volume_name)
+                volumes_exist = True
+                break
+            except docker.errors.NotFound:
+                continue
+        
+        if not volumes_exist:
+            raise HTTPException(status_code=400, detail="No containers or data volumes found to undeploy")
+    
+    if running_containers or infra_containers:
+        logger.info(f"Undeploying running services: {running_containers}, infrastructure: {infra_containers}")
+    elif remove_data and volumes_exist:
+        logger.info("No containers running, but removing data volumes as requested")
     
     try:
-        # Stop and remove containers
-        await cleanup_deployment()
+        # Stop and remove containers (if any exist)
+        if running_containers or infra_containers:
+            await cleanup_deployment()
         
         # Remove data volumes if requested
         if remove_data:
@@ -913,17 +1359,27 @@ async def undeploy(remove_data: bool = False):
                 except docker.errors.NotFound:
                     pass
         
-        # Reset state
-        deployment_state["deployed"] = False
-        deployment_state["deployment_time"] = None
-        deployment_state["configuration"] = None
-        deployment_state["database_type"] = None
-        deployment_state["mongo_type"] = None
+        # State is now computed dynamically from containers and stored config
+        # No need to manually update deployment state
+        
+        # Determine what was actually done
+        containers_removed = bool(running_containers or infra_containers)
+        volumes_removed = remove_data
+        
+        if containers_removed and volumes_removed:
+            message = "All services stopped and removed, data volumes deleted"
+        elif containers_removed:
+            message = "All services stopped and removed, data volumes preserved"
+        elif volumes_removed:
+            message = "No containers to remove, data volumes deleted"
+        else:
+            message = "No action taken"
         
         return {
             "status": "undeployed",
-            "message": "All services stopped and removed",
-            "data_removed": remove_data
+            "message": message,
+            "containers_removed": containers_removed,
+            "data_removed": volumes_removed
         }
         
     except Exception as e:
@@ -946,13 +1402,15 @@ async def status():
     healthy_count = sum(1 for s in results if s.status == "healthy")
     unhealthy_count = len(results) - healthy_count
     
+    # Get current deployment state
+    state = get_deployment_state()
+    
     # Check database status if deployed
     db_status = None
     mongo_status = None
-    if deployment_state["deployed"]:
-        if deployment_state["database_type"] == DatabaseType.MANAGED:
-            pg_container = get_container_by_name("pulsr_postgres")
-            if pg_container and pg_container.status == "running":
+    if state["deployed"]:
+        if state["database_type"] == DatabaseType.MANAGED:
+            if state["infrastructure"]["postgres"]:
                 db_status = "healthy"
             else:
                 db_status = "unhealthy"
@@ -960,9 +1418,8 @@ async def status():
             db_status = "external"
             
         # Check MongoDB status
-        if deployment_state["mongo_type"] == MongoType.MANAGED:
-            mongo_container = get_container_by_name("pulsr_mongo")
-            if mongo_container and mongo_container.status == "running":
+        if state["mongo_type"] == MongoType.MANAGED:
+            if state["infrastructure"]["mongo"]:
                 mongo_status = "healthy"
             else:
                 mongo_status = "unhealthy"
@@ -970,11 +1427,11 @@ async def status():
             mongo_status = "external"
     
     return SystemStatus(
-        deployed=deployment_state["deployed"],
-        deployment_config=deployment_state["configuration"],
-        database_type=deployment_state["database_type"],
+        deployed=state["deployed"],
+        deployment_config=state["configuration"],
+        database_type=state["database_type"],
         database_status=db_status,
-        mongo_type=deployment_state["mongo_type"],
+        mongo_type=state["mongo_type"],
         mongo_status=mongo_status,
         services=services_dict,
         healthy_count=healthy_count,
@@ -992,8 +1449,24 @@ async def service_status(service_name: str):
     return service_info
 
 @app.get("/logs/{service_name}")
-async def get_service_logs(service_name: str, lines: int = 100):
-    """Get container logs for a service."""
+async def get_service_logs(
+    service_name: str, 
+    lines: int = 100,
+    exclude_endpoints: Optional[str] = None,
+    include_endpoints: Optional[str] = None,
+    exclude_patterns: Optional[str] = None,
+    include_patterns: Optional[str] = None
+):
+    """Get container logs for a service with optional filtering.
+    
+    Args:
+        service_name: Name of the service
+        lines: Number of log lines to retrieve
+        exclude_endpoints: Comma-separated list of endpoints to exclude (e.g., "/health,/metrics")
+        include_endpoints: Comma-separated list of endpoints to include only
+        exclude_patterns: Comma-separated list of patterns to exclude from logs
+        include_patterns: Comma-separated list of patterns to include only
+    """
     if service_name not in SERVICES:
         raise HTTPException(status_code=404, detail="Service not found")
     
@@ -1003,12 +1476,75 @@ async def get_service_logs(service_name: str, lines: int = 100):
     
     try:
         logs = container.logs(tail=lines).decode('utf-8', errors='ignore')
+        original_line_count = len(logs.split('\n'))
+        
+        # Apply filtering if any filters are specified
+        if exclude_endpoints or include_endpoints or exclude_patterns or include_patterns:
+            log_lines = logs.split('\n')
+            filtered_lines = []
+            
+            # Parse filter parameters
+            exclude_endpoint_list = [ep.strip() for ep in exclude_endpoints.split(',')] if exclude_endpoints else []
+            include_endpoint_list = [ep.strip() for ep in include_endpoints.split(',')] if include_endpoints else []
+            exclude_pattern_list = [pat.strip() for pat in exclude_patterns.split(',')] if exclude_patterns else []
+            include_pattern_list = [pat.strip() for pat in include_patterns.split(',')] if include_patterns else []
+            
+            for line in log_lines:
+                should_include = True
+                
+                # Check exclude endpoints
+                if exclude_endpoint_list:
+                    for endpoint in exclude_endpoint_list:
+                        if endpoint in line:
+                            should_include = False
+                            break
+                
+                # Check include endpoints (if specified, line must contain at least one)
+                if include_endpoint_list and should_include:
+                    found_include_endpoint = False
+                    for endpoint in include_endpoint_list:
+                        if endpoint in line:
+                            found_include_endpoint = True
+                            break
+                    if not found_include_endpoint:
+                        should_include = False
+                
+                # Check exclude patterns
+                if exclude_pattern_list and should_include:
+                    for pattern in exclude_pattern_list:
+                        if pattern in line:
+                            should_include = False
+                            break
+                
+                # Check include patterns (if specified, line must contain at least one)
+                if include_pattern_list and should_include:
+                    found_include_pattern = False
+                    for pattern in include_pattern_list:
+                        if pattern in line:
+                            found_include_pattern = True
+                            break
+                    if not found_include_pattern:
+                        should_include = False
+                
+                if should_include:
+                    filtered_lines.append(line)
+            
+            logs = '\n'.join(filtered_lines)
+        
         return {
             "service": service_name,
             "container_id": container.short_id,
             "container_status": container.status,
             "logs": logs,
-            "lines_requested": lines
+            "lines_requested": lines,
+            "original_line_count": original_line_count,
+            "filtered_line_count": len(logs.split('\n')) if logs else 0,
+            "filters_applied": {
+                "exclude_endpoints": exclude_endpoints,
+                "include_endpoints": include_endpoints,
+                "exclude_patterns": exclude_patterns,
+                "include_patterns": include_patterns
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get logs: {str(e)}")
@@ -1057,14 +1593,69 @@ async def get_service_diagnostics(service_name: str):
 @app.get("/deployment")
 async def get_deployment_info():
     """Get current deployment information."""
+    state = get_deployment_state()
     return DeploymentStatus(
-        deployed=deployment_state["deployed"],
-        deployment_time=deployment_state["deployment_time"],
-        configuration=deployment_state["configuration"],
-        database_type=deployment_state["database_type"],
-        database_status="managed" if deployment_state["database_type"] == DatabaseType.MANAGED else "external",
-        services_deployed=list(SERVICES.keys()) if deployment_state["deployed"] else []
+        deployed=state["deployed"],
+        deployment_time=state["deployment_time"],
+        configuration=state["configuration"],
+        database_type=state["database_type"],
+        database_status="managed" if state["database_type"] == DatabaseType.MANAGED else "external",
+        services_deployed=list(SERVICES.keys()) if state["deployed"] else []
     )
+
+@app.post("/recover-config")
+async def recover_deployment_config():
+    """Manually recover and save deployment configuration from running containers."""
+    try:
+        # Check if containers are running
+        running_services = []
+        for service_name in SERVICES.keys():
+            container = get_container_by_name(f"pulsr_{service_name}")
+            if container and container.status == "running":
+                running_services.append(service_name)
+        
+        if not running_services:
+            raise HTTPException(status_code=400, detail="No running services found to recover configuration from")
+        
+        # Recover configuration from containers
+        recovered_config = recover_config_from_containers()
+        
+        if not recovered_config:
+            raise HTTPException(status_code=500, detail="Failed to recover configuration from containers")
+        
+        # Create a temporary DeploymentConfig object to validate the recovered config
+        try:
+            # Add required fields with defaults if missing
+            if 'secret_key' not in recovered_config:
+                raise HTTPException(status_code=400, detail="Could not recover SECRET_KEY from containers")
+            if 'hermes_api_key' not in recovered_config:
+                raise HTTPException(status_code=400, detail="Could not recover HERMES_API_KEY from containers")
+            
+            # Create config object (this will validate the structure)
+            deployment_config = DeploymentConfig(**recovered_config)
+            
+            # Save the recovered configuration
+            save_deployment_config(deployment_config)
+            
+            return {
+                "status": "success",
+                "message": "Configuration recovered and saved from running containers",
+                "recovered_fields": list(recovered_config.keys()),
+                "running_services": running_services,
+                "config_preview": {k: v for k, v in recovered_config.items() if k not in ['secret_key', 'hermes_api_key', 'postgres_password', 'scaleway_secret']}
+            }
+            
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Recovered configuration is invalid: {str(e)}")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to recover configuration: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to recover configuration: {str(e)}")
+
+# Detect existing deployment on startup
+detect_existing_deployment()
 
 if __name__ == "__main__":
     import uvicorn
